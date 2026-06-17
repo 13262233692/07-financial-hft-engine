@@ -171,10 +171,13 @@ func (g *Gateway) handleConnection(ctx context.Context, conn net.Conn) {
 				session = NewSession(senderCompID, g.targetCompID, 30, outCh,
 					func(order *model.Order) {
 						result := g.me.SubmitOrder(order)
+						if result != nil && result.Order != nil && result.Order.ID > 0 {
+							session.TrackOrder(order.ClOrdID, result.Order.ID)
+						}
 						g.sendResult(session, result)
 					},
-					func(symbol string, orderID uint64) {
-						g.me.CancelOrder(symbol, orderID)
+					func(symbol string, orderID uint64) *engine.CancelEngineResult {
+						return g.me.CancelOrder(symbol, orderID)
 					},
 				)
 
@@ -208,8 +211,9 @@ func (g *Gateway) sendResult(session *Session, result *engine.OrderResult) {
 		ordTypeStr = "1"
 	}
 
+	status := order.GetStatus()
 	var ordStatus string
-	switch order.Status {
+	switch status {
 	case model.OrderStatusNew:
 		ordStatus = "0"
 	case model.OrderStatusPartially:
@@ -224,8 +228,9 @@ func (g *Gateway) sendResult(session *Session, result *engine.OrderResult) {
 		ordStatus = "0"
 	}
 
+	filledQty := order.GetFilledQty()
 	avgPx := int64(0)
-	if order.FilledQty > 0 && len(result.Trades) > 0 {
+	if filledQty > 0 && len(result.Trades) > 0 {
 		var totalValue, totalQty int64
 		for _, t := range result.Trades {
 			totalValue += t.Price * t.Quantity
@@ -243,7 +248,7 @@ func (g *Gateway) sendResult(session *Session, result *engine.OrderResult) {
 		ordTypeStr,
 		order.Price,
 		order.Quantity,
-		order.FilledQty,
+		filledQty,
 		avgPx,
 		order.ID,
 		ordStatus,

@@ -24,6 +24,12 @@ type OrderResult struct {
 	Error  error
 }
 
+type CancelEngineResult struct {
+	Success      bool
+	CancelledQty int64
+	Error        error
+}
+
 func NewMatchingEngine(tradeOutCh chan<- *model.Trade, orderInCh <-chan *model.Order, ringSize uint64) *MatchingEngine {
 	if ringSize == 0 {
 		ringSize = 65536
@@ -74,15 +80,23 @@ func (me *MatchingEngine) SubmitOrder(order *model.Order) *OrderResult {
 	return result
 }
 
-func (me *MatchingEngine) CancelOrder(symbol string, orderID uint64) bool {
+func (me *MatchingEngine) CancelOrder(symbol string, orderID uint64) *CancelEngineResult {
 	me.mu.RLock()
 	ob, exists := me.orderBooks[symbol]
 	me.mu.RUnlock()
 
 	if !exists {
-		return false
+		return &CancelEngineResult{
+			Success: false, Error: model.ErrOrderAlreadyFilled,
+		}
 	}
-	return ob.Cancel(orderID)
+
+	result := ob.Cancel(orderID)
+	return &CancelEngineResult{
+		Success:      result.Success,
+		CancelledQty: result.CancelledQty,
+		Error:      result.Error,
+	}
 }
 
 func (me *MatchingEngine) Start() {

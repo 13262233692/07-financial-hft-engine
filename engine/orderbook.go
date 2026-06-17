@@ -2,10 +2,17 @@ package engine
 
 import (
 	"container/heap"
+	"log"
 	"sync"
 
 	"github.com/hft-engine/model"
 )
+
+type CancelResult struct {
+	Success        bool
+	CancelledQty   int64
+	Error          error
+}
 
 type priceLevel struct {
 	price  int64
@@ -89,16 +96,20 @@ func (ob *OrderBook) Submit(order *model.Order) []*model.Trade {
 	return trades
 }
 
-func (ob *OrderBook) Cancel(orderID uint64) bool {
+func (ob *OrderBook) Cancel(orderID uint64) *CancelResult {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
 
 	order, exists := ob.orderMap[orderID]
 	if !exists {
-		return false
+		return &CancelResult{Success: false, Error: model.ErrOrderAlreadyFilled}
 	}
 
-	order.Status = model.OrderStatusCancelled
+	if err := order.TryCancel(); err != nil {
+		return &CancelResult{Success: false, Error: err}
+	}
+
+	cancelledQty := order.RemainingQty()
 
 	if order.Side == model.SideBuy {
 		if level, ok := ob.bidMap[order.Price]; ok {
@@ -113,7 +124,11 @@ func (ob *OrderBook) Cancel(orderID uint64) bool {
 	}
 
 	delete(ob.orderMap, orderID)
-	return true
+
+	return &CancelResult{
+		Success:      true,
+		CancelledQty: cancelledQty,
+	}
 }
 
 func (ob *OrderBook) matchMarketOrder(order *model.Order) []*model.Trade {
@@ -123,21 +138,17 @@ func (ob *OrderBook) matchMarketOrder(order *model.Order) []*model.Trade {
 	if order.Side == model.SideBuy {
 		for ob.asks.Len() > 0 && remaining > 0 {
 			best := ob.asks[0]
-			trades = ob.matchAgainstLevel(&remaining, order, best, &ob.asks, ob.askMap, false)
+			trades = append(trades, ob.matchAgainstLevel(&remaining, order, best, &ob.asks, ob.askMap, false)...)
 		}
 	} else {
 		for ob.bids.Len() > 0 && remaining > 0 {
 			best := ob.bids[0]
-			trades = ob.matchAgainstLevel(&remaining, order, best, &ob.bids, ob.bidMap, true)
+			trades = append(trades, ob.matchAgainstLevel(&remaining, order, best, &ob.bids, ob.bidMap, true)...)
 		}
 	}
 
-	order.FilledQty = order.Quantity - remaining
-	if order.FilledQty >= order.Quantity {
-		order.Status = model.OrderStatusFilled
-	} else if order.FilledQty > 0 {
-		order.Status = model.OrderStatusPartially
-	}
+	filled := order.Quantity - remaining
+	order.TryFill(filled)
 
 	return trades
 }
@@ -152,7 +163,7 @@ func (ob *OrderBook) matchLimitOrder(order *model.Order) []*model.Trade {
 			if order.Price < best.price {
 				break
 			}
-			trades = ob.matchAgainstLevel(&remaining, order, best, &ob.asks, ob.askMap, false)
+			trades = append(trades, ob.matchAgainstLevel(&remaining, order, best, &ob.asks, ob.askMap, false)...)
 		}
 	} else {
 		for ob.bids.Len() > 0 && remaining > 0 {
@@ -160,18 +171,16 @@ func (ob *OrderBook) matchLimitOrder(order *model.Order) []*model.Trade {
 			if order.Price > best.price {
 				break
 			}
-			trades = ob.matchAgainstLevel(&remaining, order, best, &ob.bids, ob.bidMap, true)
+			trades = append(trades, ob.matchAgainstLevel(&remaining, order, best, &ob.bids, ob.bidMap, true)...)
 		}
 	}
 
-	order.FilledQty = order.Quantity - remaining
-	if order.IsFilled() {
-		order.Status = model.OrderStatusFilled
-	} else if order.FilledQty > 0 {
-		order.Status = model.OrderStatusPartially
-		ob.addOrderToBook(order)
-	} else {
-		order.Status = model.OrderStatusNew
+	filled := order.Quantity - remaining
+	if filled > 0 {
+		order.TryFill(filled)
+	}
+
+	if !order.IsFilled() {
 		ob.addOrderToBook(order)
 	}
 
@@ -180,26 +189,53 @@ func (ob *OrderBook) matchLimitOrder(order *model.Order) []*model.Trade {
 
 func (ob *OrderBook) matchAgainstLevel(remaining *int64, taker *model.Order, level *priceLevel, priceHeap heap.Interface, priceMap map[int64]*priceLevel, isBid bool) []*model.Trade {
 	var trades []*model.Trade
+	skipCount := 0
 
-	for len(level.orders) > 0 && *remaining > 0 {
-		maker := level.orders[0]
+	for len(level.orders) > skipCount && *remaining > 0 {
+		maker := level.orders[skipCount]
+
+		if !maker.IsActive() {
+			skipCount++
+			continue
+		}
+
 		matchQty := min(*remaining, maker.RemainingQty())
+		if matchQty <= 0 {
+			skipCount++
+			continue
+		}
+
 		matchPrice := maker.Price
+
+		if err := maker.TryFill(matchQty); err != nil {
+			if err == model.ErrOrderAlreadyCancelled {
+				skipCount++
+				continue
+			}
+			log.Printf("[WARN] fill failed for order %d: %v", maker.ID, err)
+			skipCount++
+			continue
+		}
 
 		trade := model.NewTrade(taker, maker, matchPrice, matchQty)
 		trades = append(trades, trade)
 
-		taker.FilledQty += matchQty
-		maker.FilledQty += matchQty
 		*remaining -= matchQty
 
 		if maker.IsFilled() {
-			maker.Status = model.OrderStatusFilled
-			level.orders = level.orders[1:]
+			skipCount++
 			delete(ob.orderMap, maker.ID)
-		} else {
-			maker.Status = model.OrderStatusPartially
 		}
+	}
+
+	if skipCount > 0 {
+		active := make([]*model.Order, 0, len(level.orders)-skipCount)
+		for _, o := range level.orders {
+			if o.IsActive() {
+				active = append(active, o)
+			}
+		}
+		level.orders = active
 	}
 
 	ob.cleanupLevel(level, priceMap, priceHeap, isBid)
@@ -208,6 +244,10 @@ func (ob *OrderBook) matchAgainstLevel(remaining *int64, taker *model.Order, lev
 }
 
 func (ob *OrderBook) addOrderToBook(order *model.Order) {
+	if !order.IsActive() {
+		return
+	}
+
 	ob.orderMap[order.ID] = order
 
 	if order.Side == model.SideBuy {

@@ -6,11 +6,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/hft-engine/engine"
 	"github.com/hft-engine/model"
 )
 
 type OrderCallback func(*model.Order)
-type CancelCallback func(symbol string, orderID uint64)
+type CancelCallback func(symbol string, orderID uint64) *engine.CancelEngineResult
 
 type Session struct {
 	senderCompID  string
@@ -26,6 +27,7 @@ type Session struct {
 	outCh         chan<- []byte
 	mu            sync.Mutex
 	loggedIn      bool
+	clOrdIDMap    map[string]uint64
 }
 
 func NewSession(senderCompID, targetCompID string, heartBtInt int, outCh chan<- []byte, onOrder OrderCallback, onCancel CancelCallback) *Session {
@@ -37,10 +39,30 @@ func NewSession(senderCompID, targetCompID string, heartBtInt int, outCh chan<- 
 		onOrder:      onOrder,
 		onCancel:     onCancel,
 		outCh:        outCh,
+		clOrdIDMap:   make(map[string]uint64),
 	}
 	s.lastRecvTime.Store(now)
 	s.lastSendTime.Store(now)
 	return s
+}
+
+func (s *Session) TrackOrder(clOrdID string, orderID uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.clOrdIDMap[clOrdID] = orderID
+}
+
+func (s *Session) GetOrderID(clOrdID string) (uint64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id, ok := s.clOrdIDMap[clOrdID]
+	return id, ok
+}
+
+func (s *Session) RemoveOrder(clOrdID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.clOrdIDMap, clOrdID)
 }
 
 func (s *Session) HandleMessage(msg *FIXMessage) {
@@ -54,7 +76,6 @@ func (s *Session) HandleMessage(msg *FIXMessage) {
 	case MsgTypeLogout:
 		s.handleLogout(msg)
 	case MsgTypeHeartbeat:
-		// no-op, lastRecvTime already updated
 	case MsgTypeTestRequest:
 		s.handleTestRequest(msg)
 	case MsgTypeNewOrderSingle:
@@ -175,8 +196,12 @@ func (s *Session) handleOrderCancel(msg *FIXMessage) {
 	symbol, _ := msg.Get(55)
 	clOrdID, _ := msg.Get(11)
 
-	_ = origClOrdID
-	_ = clOrdID
+	if origClOrdID == "" {
+		seq := atomic.AddUint64(&s.seqOut, 1)
+		rej := MakeOrderCancelReject(s.targetCompID, s.senderCompID, int(seq), clOrdID, 0, "missing OrigClOrdID")
+		s.send(rej)
+		return
+	}
 
 	if symbol == "" {
 		seq := atomic.AddUint64(&s.seqOut, 1)
@@ -185,7 +210,34 @@ func (s *Session) handleOrderCancel(msg *FIXMessage) {
 		return
 	}
 
-	log.Printf("[FIX] Cancel request from %s for symbol %s", s.senderCompID, symbol)
+	orderID, exists := s.GetOrderID(origClOrdID)
+	if !exists {
+		seq := atomic.AddUint64(&s.seqOut, 1)
+		rej := MakeOrderCancelReject(s.targetCompID, s.senderCompID, int(seq), clOrdID, 0, "order not found")
+		s.send(rej)
+		return
+	}
+
+	if s.onCancel != nil {
+		result := s.onCancel(symbol, orderID)
+		if result == nil {
+			return
+		}
+
+		if result.Success {
+			s.RemoveOrder(origClOrdID)
+			log.Printf("[FIX] Cancel succeeded for order %d (%s), cancelled qty: %d", orderID, s.senderCompID, result.CancelledQty)
+		} else {
+			seq := atomic.AddUint64(&s.seqOut, 1)
+			reason := "order already filled"
+			if result.Error != nil {
+				reason = result.Error.Error()
+			}
+			rej := MakeOrderCancelReject(s.targetCompID, s.senderCompID, int(seq), clOrdID, orderID, reason)
+			s.send(rej)
+			log.Printf("[FIX] Cancel rejected for order %d (%s): %s", orderID, s.senderCompID, reason)
+		}
+	}
 }
 
 func (s *Session) send(data []byte) {
@@ -206,9 +258,6 @@ func (s *Session) sendReject(clOrdID, text string) {
 
 func (s *Session) SendExecutionReport(clOrdID, symbol, side, ordType string,
 	price, qty, cumQty, avgPx int64, orderID uint64, ordStatus, text string) {
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	seq := atomic.AddUint64(&s.seqOut, 1)
 	report := MakeExecutionReport(s.targetCompID, s.senderCompID, int(seq),
